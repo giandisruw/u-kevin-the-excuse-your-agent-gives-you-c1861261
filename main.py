@@ -5,9 +5,14 @@ Writes the winning one-line excuse to /output/entry.txt.
 The line is a single line, 98 characters (limit 200), chosen by a local
 pairwise tournament judged against the bounty's published judge brief
 (see README.md for the tournament table).
+
+Revision (v2): the write path is now validate -> atomic write -> read-back
+verify, so a truncated or corrupted entry.txt can never be submitted
+silently. The winning line itself is unchanged, byte for byte.
 """
 
 import os
+import sys
 
 # Winning line (tournament winner — see README.md).
 # Local tournament: 14 candidates, Swiss 4 rounds (28 games) + final,
@@ -31,28 +36,75 @@ def validate(line: str) -> str:
     competition.yaml: "/output/entry.txt is UTF-8 text of 1 to 200
     characters, not only white space". Single-line follows from the
     task itself (one line, at most 200 characters). Returns the line
-    unchanged; raises AssertionError on any gate violation.
+    unchanged; raises ValueError on any gate violation.
     """
-    assert isinstance(line, str), "entry must be text"
+    if not isinstance(line, str):
+        raise ValueError("entry must be text")
     # UTF-8: encoding round-trips only if the text is encodable.
     line.encode("utf-8")
-    assert 1 <= len(line) <= 200, (
-        f"entry must be 1-200 characters, got {len(line)}"
-    )
-    assert line.strip(), "entry must not be only whitespace"
-    assert "\n" not in line and "\r" not in line, (
-        "entry must be a single line"
-    )
+    if not 1 <= len(line) <= 200:
+        raise ValueError(
+            f"entry must be 1-200 characters, got {len(line)}"
+        )
+    if not line.strip():
+        raise ValueError("entry must not be only whitespace")
+    if "\n" in line or "\r" in line:
+        raise ValueError("entry must be a single line")
+    if line != line.strip():
+        raise ValueError("entry must not have leading/trailing whitespace")
+    if any(ord(ch) < 0x20 and ch not in "\t" for ch in line):
+        raise ValueError("entry must not contain control characters")
     return line
 
 
-def main() -> None:
-    line = validate(ENTRY)
-    out_dir = output_dir()
+def write_entry(line: str, out_dir: str) -> str:
+    """Write `line` to entry.txt atomically.
+
+    Writes to a temp file in the same directory, flushes + fsyncs it,
+    then os.replace()s it over entry.txt so the file on disk is never
+    a half-written prefix. Returns the final path.
+    """
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "entry.txt"), "w", encoding="utf-8") as f:
-        f.write(line)
+    path = os.path.join(out_dir, "entry.txt")
+    tmp_path = os.path.join(out_dir, ".entry.txt.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def verify_written(path: str, expected: str) -> None:
+    """Read-back gate: entry.txt must match `expected` byte for byte.
+
+    Reads the file back as bytes and compares against the UTF-8
+    encoding of the intended line. Raises RuntimeError on any
+    mismatch so a corrupt entry fails loudly instead of being graded.
+    """
+    with open(path, "rb") as f:
+        actual = f.read()
+    expected_bytes = expected.encode("utf-8")
+    if actual != expected_bytes:
+        raise RuntimeError(
+            f"verification failed: {path} is {len(actual)} bytes, "
+            f"expected {len(expected_bytes)} bytes"
+        )
+
+
+def main() -> int:
+    line = validate(ENTRY)
+    path = write_entry(line, output_dir())
+    verify_written(path, line)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
